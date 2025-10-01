@@ -34,6 +34,7 @@ typedef struct {
     
     /* Memory measurements */
     size_t mem_start;
+    size_t mem_end;
     size_t mem_peak;
     
     /* Power and thermal measurements */

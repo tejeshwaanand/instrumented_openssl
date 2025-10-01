@@ -20,7 +20,7 @@ jobs:
         branch: ['3.5', '3.4', '3.3', '3.2', '3.0']
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       if: ${{ contains(join(github.event.pull_request.labels.*.name,','),matrix.branch) }}
       with:
         ref: ${{ github.event.pull_request.head.sha }}

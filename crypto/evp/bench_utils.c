@@ -233,7 +233,7 @@ int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey,
     double elapsed_time;
     uint64_t elapsed_cycles;
     uint64_t energy_consumed;
-    size_t mem_used;
+    size_t mem_used=0;
     
     if (ctx == NULL) {
         return -1;
@@ -295,7 +295,7 @@ int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey,
         BIO_free(bio_out);
     }
     
-    print_mem_status(); // Log memory at end
+    // print_mem_status(); // Log memory at end
     
     return 0;
 }

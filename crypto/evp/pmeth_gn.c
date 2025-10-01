@@ -21,6 +21,9 @@
 #endif
 #include "crypto/evp.h"
 #include "evp_local.h"
+#ifdef OPENSSL_BENCHMARK
+# include "bench_utils.h"
+#endif
 
 static int gen_init(EVP_PKEY_CTX *ctx, int operation)
 {
@@ -131,9 +134,21 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
     EVP_PKEY *allocated_pkey = NULL;
     /* Legacy compatible keygen callback info, only used with provider impls */
     int gentmp[2];
+#ifdef OPENSSL_BENCHMARK
+    openssl_bench_ctx_t bench_ctx;
+    
+    /* Start benchmarking */
+    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_generate") != 0) {
+        /* Continue without benchmarking if setup fails */
+    }
+#endif
 
-    if (ppkey == NULL)
+    if (ppkey == NULL) {
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
+    }
 
     if (ctx == NULL)
         goto not_supported;
@@ -146,6 +161,9 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
 
     if (*ppkey == NULL) {
         ERR_raise(ERR_LIB_EVP, ERR_R_EVP_LIB);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
     }
 
@@ -238,6 +256,10 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
             *ppkey = NULL;
         EVP_PKEY_free(allocated_pkey);
     }
+#ifdef OPENSSL_BENCHMARK
+    /* End benchmarking with the generated key */
+    openssl_bench_end(&bench_ctx, (ret > 0 && *ppkey) ? *ppkey : NULL, NULL, 0);
+#endif
     return ret;
 
  not_supported:

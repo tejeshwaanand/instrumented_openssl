@@ -1,0 +1,692 @@
+From 3c82ca715f8f84a2cfb62b8a51b31a2807064010 Mon Sep 17 00:00:00 2001
+From: Nokia PQC Research <nokia@research.com>
+Date: Fri, 29 Aug 2025 00:15:43 +0530
+Subject: [PATCH 1/3] Add benchmark utility functions for OpenSSL
+ instrumentation
+
+---
+ crypto/evp/bench_utils.c | 248 +++++++++++++++++++++++++++++++++++++++
+ crypto/evp/bench_utils.h | 116 ++++++++++++++++++
+ 2 files changed, 364 insertions(+)
+ create mode 100644 crypto/evp/bench_utils.c
+ create mode 100644 crypto/evp/bench_utils.h
+
+diff --git a/crypto/evp/bench_utils.c b/crypto/evp/bench_utils.c
+new file mode 100644
+index 0000000000..3e6d76ca83
+--- /dev/null
++++ b/crypto/evp/bench_utils.c
+@@ -0,0 +1,248 @@
++/*
++ * Copyright 2025 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include "bench_utils.h"
++
++#ifdef OPENSSL_BENCHMARK
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <openssl/bio.h>
++#include <openssl/err.h>
++#include "internal/cryptlib.h"
++
++/* Global memory tracking variables */
++static size_t g_current_mem = 0;
++static size_t g_peak_mem = 0;
++static void *(*orig_malloc)(size_t, const char *, int) = NULL;
++static void *(*orig_realloc)(void *, size_t, const char *, int) = NULL;
++static void (*orig_free)(void *, const char *, int) = NULL;
++
++/*
++ * Custom memory allocation functions for tracking
++ */
++static void *bench_malloc(size_t size, const char *file, int line)
++{
++    void *ptr = CRYPTO_malloc(size, file, line);
++    if (ptr != NULL) {
++        g_current_mem += size;
++        if (g_current_mem > g_peak_mem) {
++            g_peak_mem = g_current_mem;
++        }
++    }
++    return ptr;
++}
++
++static void *bench_realloc(void *ptr, size_t size, const char *file, int line)
++{
++    /* Note: This is a simplified approach - in practice, we'd need to track
++     * the original allocation size to properly account for realloc */
++    void *new_ptr = CRYPTO_realloc(ptr, size, file, line);
++    if (new_ptr != NULL && ptr == NULL) {
++        /* This is essentially a malloc */
++        g_current_mem += size;
++        if (g_current_mem > g_peak_mem) {
++            g_peak_mem = g_current_mem;
++        }
++    }
++    return new_ptr;
++}
++
++static void bench_free(void *ptr, const char *file, int line)
++{
++    if (ptr != NULL) {
++        /* Note: We can't accurately track the freed size without additional
++         * bookkeeping, but this is a reasonable approximation for benchmarking */
++        CRYPTO_free(ptr, file, line);
++    }
++}
++
++uint64_t openssl_bench_rdtsc(void)
++{
++    uint64_t cycles;
++#if defined(__x86_64__) || defined(__i386__)
++    unsigned int lo, hi;
++    __asm__ volatile ("rdtsc" : "=a" (lo), "=d" (hi));
++    cycles = ((uint64_t)hi << 32) | lo;
++#elif defined(__aarch64__)
++    /* ARM64 - use virtual counter */
++    __asm__ volatile ("mrs %0, cntvct_el0" : "=r" (cycles));
++#else
++    /* Fallback for other architectures */
++    cycles = 0;
++#endif
++    return cycles;
++}
++
++uint64_t openssl_bench_read_energy(void)
++{
++    FILE *fp;
++    uint64_t energy = 0;
++    
++    /* Try Intel RAPL interface */
++    fp = fopen("/sys/class/powercap/intel-rapl:0/energy_uj", "r");
++    if (fp != NULL) {
++        if (fscanf(fp, "%lu", &energy) != 1) {
++            energy = 0;
++        }
++        fclose(fp);
++    }
++    return energy;
++}
++
++int openssl_bench_read_temperature(void)
++{
++    FILE *fp;
++    int temp = 0;
++    
++    /* Try thermal zone 0 first */
++    fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
++    if (fp != NULL) {
++        if (fscanf(fp, "%d", &temp) != 1) {
++            temp = 0;
++        }
++        fclose(fp);
++    }
++    return temp;
++}
++
++size_t openssl_bench_get_pubkey_size(EVP_PKEY *pkey)
++{
++    unsigned char *der_buf = NULL;
++    int der_len;
++    
++    if (pkey == NULL) {
++        return 0;
++    }
++    
++    /* Get DER encoding of public key */
++    der_len = i2d_PUBKEY(pkey, &der_buf);
++    if (der_len <= 0) {
++        return 0;
++    }
++    
++    /* Clean up the allocated buffer */
++    OPENSSL_free(der_buf);
++    
++    return (size_t)der_len;
++}
++
++void openssl_bench_mem_reset(void)
++{
++    g_current_mem = 0;
++    g_peak_mem = 0;
++}
++
++size_t openssl_bench_mem_current(void)
++{
++    return g_current_mem;
++}
++
++size_t openssl_bench_mem_peak(void)
++{
++    return g_peak_mem;
++}
++
++int openssl_bench_start(openssl_bench_ctx_t *ctx, const char *function_name)
++{
++    if (ctx == NULL || function_name == NULL) {
++        return -1;
++    }
++    
++    /* Initialize the context */
++    memset(ctx, 0, sizeof(*ctx));
++    ctx->function_name = function_name;
++    
++    /* Setup memory tracking */
++    openssl_bench_mem_reset();
++    
++    /* Capture starting measurements */
++    gettimeofday(&ctx->start_time, NULL);
++    ctx->start_cycles = openssl_bench_rdtsc();
++    ctx->energy_start_uj = openssl_bench_read_energy();
++    ctx->temp_start_mc = openssl_bench_read_temperature();
++    ctx->mem_start = openssl_bench_mem_current();
++    
++    return 0;
++}
++
++int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey, 
++                      const unsigned char *ct_data, size_t ct_len)
++{
++    double elapsed_time;
++    uint64_t elapsed_cycles;
++    uint64_t energy_consumed;
++    size_t mem_used;
++    
++    if (ctx == NULL) {
++        return -1;
++    }
++    
++    /* Capture ending measurements */
++    gettimeofday(&ctx->end_time, NULL);
++    ctx->end_cycles = openssl_bench_rdtsc();
++    ctx->energy_end_uj = openssl_bench_read_energy();
++    ctx->temp_end_mc = openssl_bench_read_temperature();
++    ctx->mem_peak = openssl_bench_mem_peak();
++    
++    /* Get cryptographic data sizes */
++    ctx->pk_size = openssl_bench_get_pubkey_size(pkey);
++    ctx->ct_size = ct_len;
++    
++    /* Calculate differences */
++    elapsed_time = (ctx->end_time.tv_sec - ctx->start_time.tv_sec) +
++                   (ctx->end_time.tv_usec - ctx->start_time.tv_usec) / 1000000.0;
++    
++    elapsed_cycles = ctx->end_cycles - ctx->start_cycles;
++    
++    energy_consumed = (ctx->energy_end_uj >= ctx->energy_start_uj) ?
++                      (ctx->energy_end_uj - ctx->energy_start_uj) : 0;
++    
++    mem_used = ctx->mem_peak - ctx->mem_start;
++    
++    /* Log the benchmark results */
++    printf("[OPENSSL-BENCH] %s: time=%.6fs, cycles=%lu, mem=%zu bytes, "
++           "energy=%luuJ, temp_before=%.1fC, temp_after=%.1fC, "
++           "size_pk=%zu bytes, size_ct=%zu bytes, start_time=%lld.%lld, end_time=%lld.%lld\n",
++           ctx->function_name,
++           elapsed_time,
++           elapsed_cycles,
++           mem_used,
++           energy_consumed,
++           ctx->temp_start_mc / 1000.0,
++           ctx->temp_end_mc / 1000.0,
++           ctx->pk_size,
++           ctx->ct_size, ctx->start_time.tv_sec, ctx->start_time.tv_usec, ctx->end_time.tv_sec, ctx->end_time.tv_usec);
++    
++    /* Also log to OpenSSL's BIO system if available */
++    BIO *bio_out = BIO_new_fp(stdout, BIO_NOCLOSE);
++    if (bio_out != NULL) {
++        BIO_printf(bio_out, "[OPENSSL-BENCH-BIO] %s: time=%.6fs, cycles=%lu, "
++                   "mem=%zu bytes, energy=%luuJ, temp_before=%.1fC, "
++                   "temp_after=%.1fC, size_pk=%zu bytes, size_ct=%zu bytes\n",
++                   ctx->function_name,
++                   elapsed_time,
++                   elapsed_cycles,
++                   mem_used,
++                   energy_consumed,
++                   ctx->temp_start_mc / 1000.0,
++                   ctx->temp_end_mc / 1000.0,
++                   ctx->pk_size,
++                   ctx->ct_size);
++        BIO_free(bio_out);
++    }
++    
++    return 0;
++}
++
++#endif /* OPENSSL_BENCHMARK */
+diff --git a/crypto/evp/bench_utils.h b/crypto/evp/bench_utils.h
+new file mode 100644
+index 0000000000..f9c761f06e
+--- /dev/null
++++ b/crypto/evp/bench_utils.h
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2025 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#ifndef OPENSSL_BENCH_UTILS_H
++# define OPENSSL_BENCH_UTILS_H
++
++# ifdef OPENSSL_BENCHMARK
++
++#  include <openssl/evp.h>
++#  include <openssl/bio.h>
++#  include <sys/time.h>
++#  include <stdint.h>
++
++# ifdef __cplusplus
++extern "C" {
++# endif
++
++/*
++ * Benchmarking context structure to store measurements
++ * before and after cryptographic operations
++ */
++typedef struct {
++    /* Timing measurements */
++    struct timeval start_time;
++    struct timeval end_time;
++    uint64_t start_cycles;
++    uint64_t end_cycles;
++    
++    /* Memory measurements */
++    size_t mem_start;
++    size_t mem_peak;
++    
++    /* Power and thermal measurements */
++    uint64_t energy_start_uj;
++    uint64_t energy_end_uj;
++    int temp_start_mc;  /* millicelsius */
++    int temp_end_mc;    /* millicelsius */
++    
++    /* Cryptographic data sizes */
++    size_t pk_size;     /* Public key size in bytes */
++    size_t ct_size;     /* Ciphertext/output size in bytes */
++    
++    /* Function identification */
++    const char *function_name;
++} openssl_bench_ctx_t;
++
++/*
++ * Initialize benchmarking context and capture "before" measurements
++ * 
++ * @param ctx: Benchmarking context to initialize
++ * @param function_name: Name of the function being benchmarked
++ * @return: 0 on success, -1 on error
++ */
++int openssl_bench_start(openssl_bench_ctx_t *ctx, const char *function_name);
++
++/*
++ * Capture "after" measurements and log the complete benchmark data
++ * 
++ * @param ctx: Benchmarking context with start measurements
++ * @param pkey: EVP_PKEY for public key size measurement (can be NULL)
++ * @param ct_data: Pointer to ciphertext/output data (can be NULL)
++ * @param ct_len: Length of ciphertext/output data
++ * @return: 0 on success, -1 on error
++ */
++int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey, 
++                      const unsigned char *ct_data, size_t ct_len);
++
++/*
++ * Helper function to read CPU cycles using rdtsc instruction
++ * 
++ * @return: Current CPU cycle count
++ */
++uint64_t openssl_bench_rdtsc(void);
++
++/*
++ * Helper function to read energy consumption from Intel RAPL
++ * 
++ * @return: Energy consumption in microjoules, or 0 on error
++ */
++uint64_t openssl_bench_read_energy(void);
++
++/*
++ * Helper function to read CPU temperature
++ * 
++ * @return: Temperature in millicelsius, or 0 on error
++ */
++int openssl_bench_read_temperature(void);
++
++/*
++ * Helper function to get public key size in DER format
++ * 
++ * @param pkey: EVP_PKEY to measure
++ * @return: Size in bytes, or 0 on error
++ */
++size_t openssl_bench_get_pubkey_size(EVP_PKEY *pkey);
++
++/*
++ * Memory tracking functions for custom allocator integration
++ */
++void openssl_bench_mem_reset(void);
++size_t openssl_bench_mem_current(void);
++size_t openssl_bench_mem_peak(void);
++
++# ifdef __cplusplus
++}
++# endif
++
++# endif /* OPENSSL_BENCHMARK */
++
++#endif /* OPENSSL_BENCH_UTILS_H */
+-- 
+2.43.0
+
+
+From ef0164add119f0c786cc2597b6ef2e594176bbf2 Mon Sep 17 00:00:00 2001
+From: Nokia PQC Research <nokia@research.com>
+Date: Fri, 29 Aug 2025 00:15:58 +0530
+Subject: [PATCH 2/3] Instrument EVP functions for cryptographic benchmarking
+
+---
+ crypto/evp/exchange.c | 34 +++++++++++++++++++-
+ crypto/evp/kem.c      | 72 ++++++++++++++++++++++++++++++++++++++++---
+ crypto/evp/pmeth_gn.c | 24 ++++++++++++++-
+ 3 files changed, 123 insertions(+), 7 deletions(-)
+
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index dae3a2c5a8..59a7f10e5a 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -17,6 +17,9 @@
+ #include "internal/numbers.h"   /* includes SIZE_MAX */
+ #include "crypto/evp.h"
+ #include "evp_local.h"
++#ifdef OPENSSL_BENCHMARK
++# include "bench_utils.h"
++#endif
+ 
+ static void evp_keyexch_free(void *data)
+ {
+@@ -520,14 +523,28 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *pkeylen)
+ {
+     int ret;
++#ifdef OPENSSL_BENCHMARK
++    openssl_bench_ctx_t bench_ctx;
++    
++    /* Start benchmarking */
++    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_derive") != 0) {
++        /* Continue without benchmarking if setup fails */
++    }
++#endif
+ 
+     if (ctx == NULL || pkeylen == NULL) {
+         ERR_raise(ERR_LIB_EVP, ERR_R_PASSED_NULL_PARAMETER);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
+     }
+ 
+     if (!EVP_PKEY_CTX_IS_DERIVE_OP(ctx)) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
+     }
+ 
+@@ -537,15 +554,30 @@ int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *pkeylen)
+     ret = ctx->op.kex.exchange->derive(ctx->op.kex.algctx, key, pkeylen,
+                                        key != NULL ? *pkeylen : 0);
+ 
++#ifdef OPENSSL_BENCHMARK
++    /* End benchmarking with derived key size */
++    openssl_bench_end(&bench_ctx, ctx->pkey, key, pkeylen ? *pkeylen : 0);
++#endif
++
+     return ret;
+  legacy:
+     if (ctx->pmeth == NULL || ctx->pmeth->derive == NULL) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -2;
+     }
+ 
+     M_check_autoarg(ctx, key, pkeylen, EVP_F_EVP_PKEY_DERIVE)
+-        return ctx->pmeth->derive(ctx, key, pkeylen);
++    ret = ctx->pmeth->derive(ctx, key, pkeylen);
++
++#ifdef OPENSSL_BENCHMARK
++    /* End benchmarking with derived key size for legacy path */
++    openssl_bench_end(&bench_ctx, ctx->pkey, key, pkeylen ? *pkeylen : 0);
++#endif
++
++    return ret;
+ }
+ 
+ int evp_keyexch_get_number(const EVP_KEYEXCH *keyexch)
+diff --git a/crypto/evp/kem.c b/crypto/evp/kem.c
+index 2bc03e1d4e..93cda74e68 100644
+--- a/crypto/evp/kem.c
++++ b/crypto/evp/kem.c
+@@ -16,6 +16,9 @@
+ #include "internal/core.h"
+ #include "crypto/evp.h"
+ #include "evp_local.h"
++#ifdef OPENSSL_BENCHMARK
++# include "bench_utils.h"
++#endif
+ 
+ static void evp_kem_free(void *data)
+ {
+@@ -226,24 +229,55 @@ int EVP_PKEY_encapsulate(EVP_PKEY_CTX *ctx,
+                          unsigned char *out, size_t *outlen,
+                          unsigned char *secret, size_t *secretlen)
+ {
+-    if (ctx == NULL)
++    int ret;
++#ifdef OPENSSL_BENCHMARK
++    openssl_bench_ctx_t bench_ctx;
++    
++    /* Start benchmarking */
++    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_encapsulate") != 0) {
++        /* Continue without benchmarking if setup fails */
++    }
++#endif
++
++    if (ctx == NULL) {
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return 0;
++    }
+ 
+     if (ctx->operation != EVP_PKEY_OP_ENCAPSULATE) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
+     }
+ 
+     if (ctx->op.encap.algctx == NULL) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -2;
+     }
+ 
+-    if (out != NULL && secret == NULL)
++    if (out != NULL && secret == NULL) {
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return 0;
++    }
+ 
+-    return ctx->op.encap.kem->encapsulate(ctx->op.encap.algctx,
++    ret = ctx->op.encap.kem->encapsulate(ctx->op.encap.algctx,
+                                           out, outlen, secret, secretlen);
++
++#ifdef OPENSSL_BENCHMARK
++    /* End benchmarking with ciphertext size if available */
++    openssl_bench_end(&bench_ctx, ctx->pkey, out, outlen ? *outlen : 0);
++#endif
++
++    return ret;
+ }
+ 
+ int EVP_PKEY_decapsulate_init(EVP_PKEY_CTX *ctx, const OSSL_PARAM params[])
+@@ -263,22 +297,50 @@ int EVP_PKEY_decapsulate(EVP_PKEY_CTX *ctx,
+                          unsigned char *secret, size_t *secretlen,
+                          const unsigned char *in, size_t inlen)
+ {
++    int ret;
++#ifdef OPENSSL_BENCHMARK
++    openssl_bench_ctx_t bench_ctx;
++    
++    /* Start benchmarking */
++    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_decapsulate") != 0) {
++        /* Continue without benchmarking if setup fails */
++    }
++#endif
++
+     if (ctx == NULL
+         || (in == NULL || inlen == 0)
+-        || (secret == NULL && secretlen == NULL))
++        || (secret == NULL && secretlen == NULL)) {
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return 0;
++    }
+ 
+     if (ctx->operation != EVP_PKEY_OP_DECAPSULATE) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
+     }
+ 
+     if (ctx->op.encap.algctx == NULL) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -2;
+     }
+-    return ctx->op.encap.kem->decapsulate(ctx->op.encap.algctx,
++    
++    ret = ctx->op.encap.kem->decapsulate(ctx->op.encap.algctx,
+                                           secret, secretlen, in, inlen);
++
++#ifdef OPENSSL_BENCHMARK
++    /* End benchmarking with input ciphertext size */
++    openssl_bench_end(&bench_ctx, ctx->pkey, in, inlen);
++#endif
++
++    return ret;
+ }
+ 
+ static EVP_KEM *evp_kem_new(OSSL_PROVIDER *prov)
+diff --git a/crypto/evp/pmeth_gn.c b/crypto/evp/pmeth_gn.c
+index 943111889e..3a56b73b89 100644
+--- a/crypto/evp/pmeth_gn.c
++++ b/crypto/evp/pmeth_gn.c
+@@ -21,6 +21,9 @@
+ #endif
+ #include "crypto/evp.h"
+ #include "evp_local.h"
++#ifdef OPENSSL_BENCHMARK
++# include "bench_utils.h"
++#endif
+ 
+ static int gen_init(EVP_PKEY_CTX *ctx, int operation)
+ {
+@@ -131,9 +134,21 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
+     EVP_PKEY *allocated_pkey = NULL;
+     /* Legacy compatible keygen callback info, only used with provider impls */
+     int gentmp[2];
++#ifdef OPENSSL_BENCHMARK
++    openssl_bench_ctx_t bench_ctx;
++    
++    /* Start benchmarking */
++    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_generate") != 0) {
++        /* Continue without benchmarking if setup fails */
++    }
++#endif
+ 
+-    if (ppkey == NULL)
++    if (ppkey == NULL) {
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
++    }
+ 
+     if (ctx == NULL)
+         goto not_supported;
+@@ -146,6 +161,9 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
+ 
+     if (*ppkey == NULL) {
+         ERR_raise(ERR_LIB_EVP, ERR_R_EVP_LIB);
++#ifdef OPENSSL_BENCHMARK
++        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
++#endif
+         return -1;
+     }
+ 
+@@ -238,6 +256,10 @@ int EVP_PKEY_generate(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
+             *ppkey = NULL;
+         EVP_PKEY_free(allocated_pkey);
+     }
++#ifdef OPENSSL_BENCHMARK
++    /* End benchmarking with the generated key */
++    openssl_bench_end(&bench_ctx, (ret > 0 && *ppkey) ? *ppkey : NULL, NULL, 0);
++#endif
+     return ret;
+ 
+  not_supported:
+-- 
+2.43.0
+
+
+From ddd1ecc8fc596c74da176ca830f29362bd8a5f97 Mon Sep 17 00:00:00 2001
+From: Nokia PQC Research <nokia@research.com>
+Date: Fri, 29 Aug 2025 00:16:14 +0530
+Subject: [PATCH 3/3] Update build configuration to include benchmark utilities
+
+---
+ crypto/evp/build.info | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crypto/evp/build.info b/crypto/evp/build.info
+index f46bbe8843..c1f31d7ff9 100644
+--- a/crypto/evp/build.info
++++ b/crypto/evp/build.info
+@@ -4,7 +4,7 @@ $COMMON=digest.c evp_enc.c evp_lib.c evp_fetch.c evp_utils.c \
+         skeymgmt_meth.c \
+         pmeth_lib.c signature.c p_lib.c s_lib.c pmeth_gn.c exchange.c \
+         evp_rand.c asymcipher.c kem.c dh_support.c ec_support.c pmeth_check.c \
+-        evp_pkey_type.c
++        evp_pkey_type.c bench_utils.c
+ 
+ SOURCE[../../libcrypto]=$COMMON\
+         encode.c evp_key.c evp_cnf.c \
+-- 
+2.43.0
+

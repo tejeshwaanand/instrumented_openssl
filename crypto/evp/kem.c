@@ -16,6 +16,9 @@
 #include "internal/core.h"
 #include "crypto/evp.h"
 #include "evp_local.h"
+#ifdef OPENSSL_BENCHMARK
+# include "bench_utils.h"
+#endif
 
 static void evp_kem_free(void *data)
 {
@@ -226,24 +229,55 @@ int EVP_PKEY_encapsulate(EVP_PKEY_CTX *ctx,
                          unsigned char *out, size_t *outlen,
                          unsigned char *secret, size_t *secretlen)
 {
-    if (ctx == NULL)
+    int ret;
+#ifdef OPENSSL_BENCHMARK
+    openssl_bench_ctx_t bench_ctx;
+    
+    /* Start benchmarking */
+    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_encapsulate") != 0) {
+        /* Continue without benchmarking if setup fails */
+    }
+#endif
+
+    if (ctx == NULL) {
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return 0;
+    }
 
     if (ctx->operation != EVP_PKEY_OP_ENCAPSULATE) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
     }
 
     if (ctx->op.encap.algctx == NULL) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -2;
     }
 
-    if (out != NULL && secret == NULL)
+    if (out != NULL && secret == NULL) {
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return 0;
+    }
 
-    return ctx->op.encap.kem->encapsulate(ctx->op.encap.algctx,
+    ret = ctx->op.encap.kem->encapsulate(ctx->op.encap.algctx,
                                           out, outlen, secret, secretlen);
+
+#ifdef OPENSSL_BENCHMARK
+    /* End benchmarking with ciphertext size if available */
+    openssl_bench_end(&bench_ctx, ctx->pkey, out, outlen ? *outlen : 0);
+#endif
+
+    return ret;
 }
 
 int EVP_PKEY_decapsulate_init(EVP_PKEY_CTX *ctx, const OSSL_PARAM params[])
@@ -263,22 +297,50 @@ int EVP_PKEY_decapsulate(EVP_PKEY_CTX *ctx,
                          unsigned char *secret, size_t *secretlen,
                          const unsigned char *in, size_t inlen)
 {
+    int ret;
+#ifdef OPENSSL_BENCHMARK
+    openssl_bench_ctx_t bench_ctx;
+    
+    /* Start benchmarking */
+    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_decapsulate") != 0) {
+        /* Continue without benchmarking if setup fails */
+    }
+#endif
+
     if (ctx == NULL
         || (in == NULL || inlen == 0)
-        || (secret == NULL && secretlen == NULL))
+        || (secret == NULL && secretlen == NULL)) {
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return 0;
+    }
 
     if (ctx->operation != EVP_PKEY_OP_DECAPSULATE) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
     }
 
     if (ctx->op.encap.algctx == NULL) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -2;
     }
-    return ctx->op.encap.kem->decapsulate(ctx->op.encap.algctx,
+    
+    ret = ctx->op.encap.kem->decapsulate(ctx->op.encap.algctx,
                                           secret, secretlen, in, inlen);
+
+#ifdef OPENSSL_BENCHMARK
+    /* End benchmarking with input ciphertext size */
+    openssl_bench_end(&bench_ctx, ctx->pkey, in, inlen);
+#endif
+
+    return ret;
 }
 
 static EVP_KEM *evp_kem_new(OSSL_PROVIDER *prov)

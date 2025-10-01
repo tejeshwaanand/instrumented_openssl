@@ -17,6 +17,9 @@
 #include "internal/numbers.h"   /* includes SIZE_MAX */
 #include "crypto/evp.h"
 #include "evp_local.h"
+#ifdef OPENSSL_BENCHMARK
+# include "bench_utils.h"
+#endif
 
 static void evp_keyexch_free(void *data)
 {
@@ -520,14 +523,28 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
 int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *pkeylen)
 {
     int ret;
+#ifdef OPENSSL_BENCHMARK
+    openssl_bench_ctx_t bench_ctx;
+    
+    /* Start benchmarking */
+    if (openssl_bench_start(&bench_ctx, "EVP_PKEY_derive") != 0) {
+        /* Continue without benchmarking if setup fails */
+    }
+#endif
 
     if (ctx == NULL || pkeylen == NULL) {
         ERR_raise(ERR_LIB_EVP, ERR_R_PASSED_NULL_PARAMETER);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
     }
 
     if (!EVP_PKEY_CTX_IS_DERIVE_OP(ctx)) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_INITIALIZED);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -1;
     }
 
@@ -537,15 +554,30 @@ int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *pkeylen)
     ret = ctx->op.kex.exchange->derive(ctx->op.kex.algctx, key, pkeylen,
                                        key != NULL ? *pkeylen : 0);
 
+#ifdef OPENSSL_BENCHMARK
+    /* End benchmarking with derived key size */
+    openssl_bench_end(&bench_ctx, ctx->pkey, key, pkeylen ? *pkeylen : 0);
+#endif
+
     return ret;
  legacy:
     if (ctx->pmeth == NULL || ctx->pmeth->derive == NULL) {
         ERR_raise(ERR_LIB_EVP, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+#ifdef OPENSSL_BENCHMARK
+        openssl_bench_end(&bench_ctx, NULL, NULL, 0);
+#endif
         return -2;
     }
 
     M_check_autoarg(ctx, key, pkeylen, EVP_F_EVP_PKEY_DERIVE)
-        return ctx->pmeth->derive(ctx, key, pkeylen);
+    ret = ctx->pmeth->derive(ctx, key, pkeylen);
+
+#ifdef OPENSSL_BENCHMARK
+    /* End benchmarking with derived key size for legacy path */
+    openssl_bench_end(&bench_ctx, ctx->pkey, key, pkeylen ? *pkeylen : 0);
+#endif
+
+    return ret;
 }
 
 int evp_keyexch_get_number(const EVP_KEYEXCH *keyexch)

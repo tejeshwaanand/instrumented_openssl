@@ -222,7 +222,7 @@ int openssl_bench_start(openssl_bench_ctx_t *ctx, const char *function_name)
     // ctx->mem_start = openssl_bench_mem_current();
     
     // print_mem_status(); // Log memory at start
-    ctx->mem_start = get_current_memory_kb(); // Save current memory at start
+    // ctx->mem_start = get_current_memory_kb(); // Save current memory at start
 
     return 0;
 }
@@ -245,8 +245,8 @@ int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey,
     ctx->energy_end_uj = openssl_bench_read_energy();
     ctx->temp_end_mc = openssl_bench_read_temperature();
     // print_mem_status(); // Log memory at end
-    ctx->mem_end = get_current_memory_kb(); // Save current memory at end
-    ctx->mem_peak = get_peak_memory_kb(); // Save peak memory at end
+    // ctx->mem_end = get_current_memory_kb(); // Save current memory at end
+    // ctx->mem_peak = get_peak_memory_kb(); // Save peak memory at end
     
     /* Get cryptographic data sizes */
     ctx->pk_size = openssl_bench_get_pubkey_size(pkey);
@@ -259,9 +259,9 @@ int openssl_bench_end(openssl_bench_ctx_t *ctx, EVP_PKEY *pkey,
     elapsed_cycles = ctx->end_cycles - ctx->start_cycles;
     
     energy_consumed = (ctx->energy_end_uj >= ctx->energy_start_uj) ?
-                      (ctx->energy_end_uj - ctx->energy_start_uj) : 0;
+                      (ctx->energy_end_uj - ctx->energy_start_uj) : 262143328850 -ctx->energy_start_uj + ctx->energy_end_uj;
 
-    mem_used = (ctx->mem_end - ctx->mem_start) * 1024;
+    mem_used = get_current_memory_kb() * 1024;
 
     /* Log the benchmark results */
     printf("[OPENSSL-BENCH] %s: time=%.6fs, cycles=%lu, mem=%zu bytes, "
